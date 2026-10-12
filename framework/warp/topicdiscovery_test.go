@@ -267,6 +267,9 @@ func TestWarpUpkeepMergesTopicsThatMeanTheSameThing(t *testing.T) {
 		{ID: "twin", Label: "Refunds", Centroid: logstore.EncodeWarpVector(tight(0, 0.05)), Cohesion: 0.98, AssignFloor: 0.9, EmbeddingSignature: signature},
 		{ID: "namesake", Label: "  refund REQUESTS ", Centroid: logstore.EncodeWarpVector(tight(2, 0)), Cohesion: 0.98, EmbeddingSignature: signature},
 		{ID: "apart", Label: "Password resets", Centroid: logstore.EncodeWarpVector(tight(1, 0)), Cohesion: 0.98, EmbeddingSignature: signature},
+		// Merged into twin by an earlier pass. When twin merges into big it
+		// has to follow, so no merged topic ever points at a merged topic.
+		{ID: "earlier", Label: "Refund", Centroid: logstore.EncodeWarpVector(tight(0, 0.1)), Cohesion: 0.98, EmbeddingSignature: signature, Status: logstore.WarpTopicStatusMerged, MergedInto: "twin"},
 	}))
 	var rows []logstore.WarpTopicAssignment
 	file := func(topic string, count int) {
@@ -278,6 +281,7 @@ func TestWarpUpkeepMergesTopicsThatMeanTheSameThing(t *testing.T) {
 	file("twin", 10)
 	file("namesake", 5)
 	file("apart", 20)
+	file("earlier", 3)
 	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, rows))
 
 	done, err := service.MaintainTopics(ctx)
@@ -292,19 +296,20 @@ func TestWarpUpkeepMergesTopicsThatMeanTheSameThing(t *testing.T) {
 	require.InDelta(t, 0.9, survivor.AssignFloor, 1e-9, "and keeps its floor")
 	require.Less(t, survivor.Cohesion, 0.98, "its cohesion now covers what it absorbed")
 
-	for _, id := range []string{"twin", "namesake"} {
+	for _, id := range []string{"twin", "namesake", "earlier"} {
 		merged, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{IDs: []string{id}})
 		require.NoError(t, err)
 		require.Len(t, merged, 1)
 		require.Equal(t, logstore.WarpTopicStatusMerged, merged[0].Status, id)
 		require.Equal(t, "big", merged[0].MergedInto, id)
+		require.NotEmpty(t, merged[0].Centroid, "%s is written back whole", id)
 	}
 
 	listed, total := listAllTopics(t, NewTopicReader(&recordingStore{row: assignTestRow()}, store))
 	require.Len(t, listed, 2)
-	require.Equal(t, 65, total)
+	require.Equal(t, 68, total)
 	require.Equal(t, "Refund requests", listed[0].Label)
-	require.Equal(t, 45, int(listed[0].Requests), "30 of its own, 10 and 5 filed under the topics merged into it")
+	require.Equal(t, 48, int(listed[0].Requests), "30 of its own, 10, 5 and 3 filed under the topics merged into it")
 	require.Equal(t, 20, int(listed[1].Requests))
 
 	// Its series folds them in the same way, bucket by bucket.
@@ -316,15 +321,15 @@ func TestWarpUpkeepMergesTopicsThatMeanTheSameThing(t *testing.T) {
 	for _, point := range list.Topics[0].Series {
 		inSeries += point.Requests
 	}
-	require.EqualValues(t, 45, inSeries)
+	require.EqualValues(t, 48, inSeries)
 
 	// A topic merged into one that is later merged itself still resolves.
 	survivor.Status, survivor.MergedInto = logstore.WarpTopicStatusMerged, "apart"
 	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{survivor}))
 	listed, total = listAllTopics(t, NewTopicReader(&recordingStore{row: assignTestRow()}, store))
 	require.Len(t, listed, 1)
-	require.Equal(t, 65, total)
-	require.Equal(t, 65, int(listed[0].Requests))
+	require.Equal(t, 68, total)
+	require.Equal(t, 68, int(listed[0].Requests))
 }
 
 // discoveryQueue records what the scheduler enqueued.
@@ -464,6 +469,30 @@ func TestWarpShutdownInterruptsUpkeep(t *testing.T) {
 		t.Fatal("the pass in flight was not interrupted")
 	}
 	service.Shutdown()
+}
+
+// vanishingTopicStore lists merged topics but has none by id, as a store does
+// when a topic is deleted between the two reads.
+type vanishingTopicStore struct {
+	logstore.WarpTopicStore
+	merged []logstore.WarpTopic
+}
+
+func (s vanishingTopicStore) ListWarpTopics(_ context.Context, filter logstore.WarpTopicFilter) ([]logstore.WarpTopic, error) {
+	if len(filter.IDs) > 0 {
+		return nil, nil
+	}
+	return s.merged, nil
+}
+
+// A merged topic that cannot be read back whole is reported as missing, with
+// how many rows came back, rather than as a wrapped nil error.
+func TestRepointMergedTopicsReportsAMissingRow(t *testing.T) {
+	store := vanishingTopicStore{merged: []logstore.WarpTopic{{ID: "old", MergedInto: "gone"}}}
+	_, err := repointMergedTopics(context.Background(), store, []logstore.WarpTopic{{ID: "gone", MergedInto: "survivor"}})
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "%!w")
+	require.Contains(t, err.Error(), "want 1 row, got 0")
 }
 
 func TestResolveMergedTopics(t *testing.T) {
