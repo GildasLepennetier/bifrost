@@ -451,6 +451,9 @@ func semanticVectorFilters(filters *logstore.SearchFilters) []vectorstore.Query 
 	queries = appendScalarQuery(queries, "virtual_key_id", filters.VirtualKeyIDs)
 	queries = appendScalarQuery(queries, "user_id", filters.UserIDs)
 	queries = appendScalarQuery(queries, "app", filters.Apps)
+	// No session_id prefilter: vectors indexed before the session was stored
+	// on them have none, and an exact match would hide every one of them.
+	// matchesSemanticFilters applies the session after hydration.
 	queries = appendContainsAnyQuery(queries, "team_ids", filters.TeamIDs)
 	queries = appendContainsAnyQuery(queries, "customer_ids", filters.CustomerIDs)
 	queries = appendContainsAnyQuery(queries, "business_unit_ids", filters.BusinessUnitIDs)
@@ -511,6 +514,11 @@ func matchesSemanticFilters(entry *logstore.Log, filters *logstore.SearchFilters
 		return false
 	}
 	if !matchesString(entry.Provider, filters.Providers) || !matchesString(entry.Model, filters.Models) || !matchesString(entry.Status, filters.Status) || !matchesPointer(entry.VirtualKeyID, filters.VirtualKeyIDs) || !matchesPointer(entry.UserID, filters.UserIDs) || !matchesPointer(entry.App, filters.Apps) {
+		return false
+	}
+	// Exact, not EqualFold: a session id is opaque, and the log store matches
+	// it exactly.
+	if filters.SessionID != "" && (entry.SessionID == nil || *entry.SessionID != filters.SessionID) {
 		return false
 	}
 	if !intersectsIDs(mergedIDs(entry.TeamID, entry.TeamIDs), filters.TeamIDs) || !intersectsIDs(mergedIDs(entry.CustomerID, entry.CustomerIDs), filters.CustomerIDs) || !intersectsIDs(mergedIDs(entry.BusinessUnitID, entry.BusinessUnitIDs), filters.BusinessUnitIDs) {

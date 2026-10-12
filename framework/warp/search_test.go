@@ -240,6 +240,35 @@ func TestWarpSemanticRefillsCandidatesPastFilteredRows(t *testing.T) {
 // the rows this one silently dropped. Both ends normalize to lower case:
 // buildLogIndexItem stores the scalar fields lowered, and the filter values
 // are lowered to meet them.
+// A session filter used to reach semantic search and do nothing: the post-
+// filter never looked, so "what was asked in this session" came back with
+// every session's rows. It is honoured after hydration, exactly - a session id
+// is opaque, and the log store matches it exactly. It is not a vector
+// prefilter: vectors indexed before the session was stored on them have no
+// session_id, and an exact prefilter would hide every one of them.
+func TestWarpSemanticFiltersNarrowToASession(t *testing.T) {
+	_, ok := semanticVectorFilterFields(semanticVectorFilters(&logstore.SearchFilters{SessionID: "Sess-1"}))["session_id"]
+	require.False(t, ok, "the session is not a vector prefilter")
+
+	mine, theirs := "Sess-1", "sess-1"
+	inSession := &logstore.Log{Provider: "openai", SessionID: &mine}
+	another := &logstore.Log{Provider: "openai", SessionID: &theirs}
+	none := &logstore.Log{Provider: "openai"}
+	filters := &logstore.SearchFilters{SessionID: "Sess-1"}
+	require.True(t, matchesSemanticFilters(inSession, filters))
+	require.False(t, matchesSemanticFilters(another, filters), "a session differing only in case is another session")
+	require.False(t, matchesSemanticFilters(none, filters), "a request in no session is not in this one")
+	require.True(t, matchesSemanticFilters(none, &logstore.SearchFilters{}))
+}
+
+func semanticVectorFilterFields(queries []vectorstore.Query) map[string]vectorstore.Query {
+	fields := map[string]vectorstore.Query{}
+	for _, query := range queries {
+		fields[query.Field] = query
+	}
+	return fields
+}
+
 func TestWarpSemanticScalarFiltersAreCaseInsensitive(t *testing.T) {
 	queries := semanticVectorFilters(&logstore.SearchFilters{
 		Providers: []string{"OpenAI"},
