@@ -826,6 +826,7 @@ export interface CoreConfig {
 	log_retention_days: number;
 	enforce_auth_on_inference: boolean;
 	dual_credential_conflict_behavior?: "error" | "prefer_vk" | "prefer_idp";
+	extra_fields_placement?: "body" | "headers";
 	allowed_origins: string[];
 	allowed_headers: string[];
 	max_request_body_size_mb: number;
@@ -884,6 +885,7 @@ export const DefaultCoreConfig: CoreConfig = {
 	log_retention_days: 365,
 	enforce_auth_on_inference: true,
 	dual_credential_conflict_behavior: "prefer_idp",
+	extra_fields_placement: "body",
 	allowed_origins: [],
 	max_request_body_size_mb: 100,
 	compat: {
