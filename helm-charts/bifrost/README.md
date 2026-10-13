@@ -4,9 +4,15 @@
 
 Official Helm charts for deploying [Bifrost](https://github.com/maximhq/bifrost) - a high-performance AI gateway with unified interface for multiple providers.
 
-**Latest Version:** 2.1.44
+**Latest Version:** 2.1.45
 
 ## Changelog
+
+### Upcoming
+
+- Added `nodeSelector`, `tolerations` and `affinity` to the chart-managed Redis (`vectorStore.redis.master.*`), Qdrant (`vectorStore.qdrant.*`) and Weaviate (`vectorStore.weaviate.*`) deployments, matching `postgresql.primary.*`. Lets these stateful pods be pinned to dedicated or non-spot nodes. Defaults are empty and render nothing. Pod-spec only, no config.json change. Closes #3440.
+- Added `azure-key-vault` as a `storage.configStore.vaultStore.type` option (`storage.configStore.vaultStore.azure`: `vaultUrl`, `tenantId`, `clientId`, `clientSecret`). Renders into `config_store.vault_store.azure`. Omit `clientId`/`clientSecret` to use `DefaultAzureCredential` (workload identity, managed identity, or `AZURE_*` env vars) instead of a service principal.
+- Added Kubernetes auth for the `hashicorp-vault` vault store backend: `storage.configStore.vaultStore.hashicorp.kubernetesRole`, `.kubernetesMountPath` (default `kubernetes`), `.kubernetesTokenPath` (default `/var/run/secrets/kubernetes.io/serviceaccount/token`). Renders into `config_store.vault_store.hashicorp.kubernetes_role` / `kubernetes_mount_path` / `kubernetes_token_path`, letting a pod authenticate with its own service account token instead of a static token or AppRole. Tokens issued via AppRole or Kubernetes auth are now renewed in the background.
 
 ### 2.1.44
 
