@@ -219,6 +219,8 @@ type anthropicToResponsesStreamState struct {
 	// converter-built, so consuming the index would skip a number.
 	passthrough bool
 
+	pendingHostedToolSearchID *string // hosted tool_search_call awaiting its tool_search_output
+
 	// codeExecToolNameByItem remembers each code_interpreter_call's Anthropic
 	// sub-tool name (captured at output_item.added) so the code block's input can be
 	// reconstructed and closed on code.done — emitted before the nested web_search
@@ -603,6 +605,30 @@ func getOrCreateAnthropicToResponsesStreamState(ctx *schemas.BifrostContext) *an
 	state := &anthropicToResponsesStreamState{}
 	ctx.SetValue(anthropicToResponsesStreamStateKey, state)
 	return state
+}
+
+type anthropicClientToolSearchKeyType struct{}
+
+var anthropicClientToolSearchKey = anthropicClientToolSearchKeyType{}
+
+// setAnthropicClientToolSearch records the name of the function an inbound Anthropic
+// request runs as its own tool search. A provider that runs the search as a
+// client-executed tool_search (OpenAI) returns a tool_search_call, which egress turns
+// back into a tool_use for this name.
+func setAnthropicClientToolSearch(ctx *schemas.BifrostContext, name string) {
+	if ctx == nil || name == "" {
+		return
+	}
+	ctx.SetValue(anthropicClientToolSearchKey, name)
+}
+
+// anthropicClientToolSearchFrom returns the name recorded by setAnthropicClientToolSearch.
+func anthropicClientToolSearchFrom(ctx *schemas.BifrostContext) string {
+	if ctx == nil {
+		return ""
+	}
+	name, _ := ctx.Value(anthropicClientToolSearchKey).(string)
+	return name
 }
 
 type anthropicNativeEffortKeyType struct{}
@@ -3103,6 +3129,12 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		addedState := getOrCreateAnthropicToResponsesStreamState(ctx)
 		blockIdx := addedState.allocBlockIndex(reverseStreamItemKey(bifrostResp))
 
+		// OpenAI tool search items carry their whole payload on output_item.done, so
+		// their blocks are all emitted there.
+		if isVerbatimToolSearchItem(bifrostResp.Item) {
+			return nil
+		}
+
 		// A computer call's actions only arrive on output_item.done, and a batched call
 		// becomes several tool_use blocks, so its blocks are all emitted there. On the
 		// passthrough path Claude's raw deltas and stop follow, so only the start is ours.
@@ -3528,6 +3560,9 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 
 	case schemas.ResponsesStreamResponseTypeOutputItemDone:
 		getOrCreateAnthropicToResponsesStreamState(ctx).clearEmittedTextProgress(reverseStreamItemKey(bifrostResp))
+		if isVerbatimToolSearchItem(bifrostResp.Item) {
+			return openAIToolSearchItemStreamEvents(ctx, bifrostResp)
+		}
 		// Handle WebSearch tool completion with sanitization and synthetic delta generation
 		if bifrostResp.Item != nil &&
 			bifrostResp.Item.Type != nil &&
@@ -4365,6 +4400,10 @@ func (req *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 	// Set the converted messages
 	if len(bifrostMessages) > 0 {
 		bifrostReq.Input = bifrostMessages
+	}
+
+	if bifrostReq.Params != nil {
+		setAnthropicClientToolSearch(ctx, schemas.ClientToolSearchFunctionName(bifrostReq.Params.Tools, bifrostReq.Input))
 	}
 
 	return bifrostReq
@@ -5302,6 +5341,7 @@ func convertAnthropicMessagesToBifrostMessages(ctx *schemas.BifrostContext, anth
 // This is the main conversion method from Bifrost to Anthropic - handles all message types and returns messages + system content.
 // provider and model are used to gate mid-conversation system message support (Anthropic + Opus 4.8+ only).
 func ConvertBifrostMessagesToAnthropicMessages(ctx *schemas.BifrostContext, bifrostMessages []schemas.ResponsesMessage, isRequestMessage bool, caps schemas.ModelCaps) ([]AnthropicMessage, *AnthropicContent) {
+	bifrostMessages = normalizeOpenAIToolSearchItems(ctx, bifrostMessages, isRequestMessage)
 	// If only a single system message is present, convert it user message (since openai allows it)
 	if len(bifrostMessages) == 1 && bifrostMessages[0].Role != nil && (*bifrostMessages[0].Role == schemas.ResponsesInputMessageRoleSystem || *bifrostMessages[0].Role == schemas.ResponsesInputMessageRoleDeveloper) {
 		if systemContent := convertBifrostMessageToAnthropicSystemContent(caps, &bifrostMessages[0]); systemContent != nil {
@@ -8590,6 +8630,166 @@ func convertBifrostToolSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage
 	}
 
 	return []AnthropicContentBlock{serverToolUseBlock, resultBlock}
+}
+
+// normalizeOpenAIToolSearchItems rewrites the tool_search_call / tool_search_output
+// items an OpenAI model emits into the shapes the message conversion below renders
+// for an Anthropic client:
+//   - a client-executed tool_search_call becomes a function_call to the caller's own
+//     search function, so it surfaces as a tool_use the client runs;
+//   - a hosted (server) tool_search_call absorbs the tool names its paired
+//     tool_search_output loaded, so it surfaces as server_tool_use plus
+//     tool_search_tool_result; the output item itself is folded away.
+//
+// On the request path these verbatim OpenAI items have no Anthropic equivalent, so
+// they are dropped. Returns msgs unchanged when it holds no verbatim tool_search item.
+func normalizeOpenAIToolSearchItems(ctx *schemas.BifrostContext, msgs []schemas.ResponsesMessage, isRequestMessage bool) []schemas.ResponsesMessage {
+	isVerbatimToolSearch := func(m *schemas.ResponsesMessage) bool {
+		return m.Type != nil && (*m.Type == schemas.ResponsesMessageTypeToolSearchCall ||
+			*m.Type == schemas.ResponsesMessageTypeToolSearchOutput) && m.IsVerbatimItem()
+	}
+	if !slices.ContainsFunc(msgs, func(m schemas.ResponsesMessage) bool { return isVerbatimToolSearch(&m) }) {
+		return msgs
+	}
+	searchName := anthropicClientToolSearchFrom(ctx)
+	if searchName == "" {
+		searchName = "tool_search"
+	}
+	out := make([]schemas.ResponsesMessage, 0, len(msgs))
+	pendingHosted := -1 // index in out of the hosted call awaiting its output
+	for i := range msgs {
+		msg := msgs[i]
+		if !isVerbatimToolSearch(&msg) {
+			out = append(out, msg)
+			continue
+		}
+		if isRequestMessage {
+			continue
+		}
+		if *msg.Type == schemas.ResponsesMessageTypeToolSearchOutput {
+			if !msg.IsClientToolSearchItem() && pendingHosted >= 0 {
+				toolMsg := *out[pendingHosted].ResponsesToolMessage
+				toolMsg.ResponsesToolSearchCall = &schemas.ResponsesToolSearchCall{ToolReferences: msg.ToolSearchOutputToolNames()}
+				out[pendingHosted].ResponsesToolMessage = &toolMsg
+				pendingHosted = -1
+			}
+			continue
+		}
+		var toolMsg schemas.ResponsesToolMessage
+		if msg.ResponsesToolMessage != nil {
+			toolMsg.CallID = msg.CallID
+			toolMsg.Arguments = msg.Arguments
+		}
+		if msg.IsClientToolSearchItem() {
+			if toolMsg.CallID == nil {
+				continue
+			}
+			toolMsg.Name = schemas.Ptr(searchName)
+			out = append(out, schemas.ResponsesMessage{
+				ID:                   msg.ID,
+				Type:                 schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+				Status:               msg.Status,
+				ResponsesToolMessage: &toolMsg,
+			})
+			continue
+		}
+		// OpenAI's hosted search reads natural-language queries, as bm25 does.
+		toolMsg.Name = schemas.Ptr(string(AnthropicToolNameToolSearchBM25))
+		out = append(out, schemas.ResponsesMessage{
+			ID:                   msg.ID,
+			Type:                 msg.Type,
+			Status:               msg.Status,
+			ResponsesToolMessage: &toolMsg,
+		})
+		pendingHosted = len(out) - 1
+	}
+	return out
+}
+
+// isVerbatimToolSearchItem reports whether item is a tool_search_call or
+// tool_search_output decoded verbatim from an OpenAI-shaped upstream.
+func isVerbatimToolSearchItem(item *schemas.ResponsesMessage) bool {
+	return item != nil && item.Type != nil &&
+		(*item.Type == schemas.ResponsesMessageTypeToolSearchCall || *item.Type == schemas.ResponsesMessageTypeToolSearchOutput) &&
+		item.IsVerbatimItem()
+}
+
+// openAIToolSearchItemStreamEvents renders a completed OpenAI tool search item as
+// whole Anthropic blocks at the index reserved on output_item.added, matching the
+// non-streaming normalizeOpenAIToolSearchItems: a client-executed call becomes a
+// tool_use for the caller's search function, a hosted call becomes server_tool_use,
+// and the hosted output becomes the paired tool_search_tool_result.
+func openAIToolSearchItemStreamEvents(ctx *schemas.BifrostContext, bifrostResp *schemas.BifrostResponsesStreamResponse) []*AnthropicStreamEvent {
+	state := getOrCreateAnthropicToResponsesStreamState(ctx)
+	idx := state.blockIndexFor(reverseStreamItemKey(bifrostResp))
+	item := bifrostResp.Item
+	var callID, args *string
+	if item.ResponsesToolMessage != nil {
+		callID, args = item.CallID, item.Arguments
+	}
+	input := json.RawMessage("{}")
+	if args != nil && *args != "" && json.Valid([]byte(*args)) {
+		input = json.RawMessage(*args)
+	}
+
+	var block AnthropicContentBlock
+	var partial *string
+	switch {
+	case *item.Type == schemas.ResponsesMessageTypeToolSearchCall && item.IsClientToolSearchItem():
+		if callID == nil {
+			return nil
+		}
+		name := anthropicClientToolSearchFrom(ctx)
+		if name == "" {
+			name = "tool_search"
+		}
+		block = AnthropicContentBlock{
+			Type:  AnthropicContentBlockTypeToolUse,
+			ID:    providerUtils.SanitizeAnthropicToolUseIDPtr(callID),
+			Name:  schemas.Ptr(name),
+			Input: json.RawMessage("{}"),
+		}
+		partial = schemas.Ptr(string(input))
+	case *item.Type == schemas.ResponsesMessageTypeToolSearchCall:
+		id := item.ID
+		if callID != nil {
+			id = callID
+		}
+		if id == nil {
+			return nil
+		}
+		state.pendingHostedToolSearchID = providerUtils.SanitizeAnthropicToolUseIDPtr(id)
+		block = AnthropicContentBlock{
+			Type:  AnthropicContentBlockTypeServerToolUse,
+			ID:    state.pendingHostedToolSearchID,
+			Name:  schemas.Ptr(string(AnthropicToolNameToolSearchBM25)),
+			Input: input,
+		}
+	default:
+		if item.IsClientToolSearchItem() || state.pendingHostedToolSearchID == nil {
+			return nil
+		}
+		var refs []AnthropicContentBlock
+		for _, name := range item.ToolSearchOutputToolNames() {
+			refs = append(refs, AnthropicContentBlock{Type: AnthropicContentBlockTypeToolReference, ToolName: schemas.Ptr(name)})
+		}
+		block = AnthropicContentBlock{
+			Type:           AnthropicContentBlockTypeToolSearchToolResult,
+			ToolUseID:      state.pendingHostedToolSearchID,
+			ToolReferences: refs,
+		}
+		state.pendingHostedToolSearchID = nil
+	}
+
+	events := []*AnthropicStreamEvent{{Type: AnthropicStreamEventTypeContentBlockStart, Index: idx, ContentBlock: &block}}
+	if partial != nil {
+		events = append(events, &AnthropicStreamEvent{
+			Type:  AnthropicStreamEventTypeContentBlockDelta,
+			Index: idx,
+			Delta: &AnthropicStreamDelta{Type: AnthropicStreamDeltaTypeInputJSON, PartialJSON: partial},
+		})
+	}
+	return append(events, &AnthropicStreamEvent{Type: AnthropicStreamEventTypeContentBlockStop, Index: idx})
 }
 
 // isAnthropicCodeExecutionToolName reports whether name is one of the code

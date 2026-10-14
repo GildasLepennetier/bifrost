@@ -768,3 +768,200 @@ func TestClientToolResultToolReferenceSurvivesRoundTrip(t *testing.T) {
 			`{"type":"tool_reference","tool_name":"`+tsDiscoveredTool+`"}]}]`,
 		string(wire.Messages[2].Content))
 }
+
+// OpenAI tool search behind /anthropic/v1/messages. OpenAI (gpt-5.4+) emits its own
+// tool_search_call / tool_search_output items; an Anthropic client must see them as
+// the blocks it understands: a client-executed search becomes a tool_use for the
+// client's own search function, a hosted search becomes server_tool_use plus
+// tool_search_tool_result.
+
+// clientToolSearchRequest is the Claude Code shape: a client search function plus a
+// deferred tool it loads through tool_reference results.
+func clientToolSearchRequest() *AnthropicMessageRequest {
+	return &AnthropicMessageRequest{
+		Model:     "gpt-6-sol",
+		MaxTokens: 1024,
+		Tools: []AnthropicTool{
+			{Name: "ToolSearch", Description: schemas.Ptr("Load deferred tools by name."), InputSchema: &schemas.ToolFunctionParameters{Type: "object"}},
+			{Name: tsDiscoveredTool, DeferLoading: schemas.Ptr(true), InputSchema: &schemas.ToolFunctionParameters{Type: "object"}},
+		},
+		Messages: []AnthropicMessage{
+			{Role: AnthropicMessageRoleUser, Content: AnthropicContent{ContentStr: schemas.Ptr("What is the weather in Tokyo?")}},
+		},
+	}
+}
+
+// decodeResponsesItem decodes an item the way it arrives from the OpenAI wire.
+func decodeResponsesItem(t *testing.T, raw string) schemas.ResponsesMessage {
+	t.Helper()
+	var item schemas.ResponsesMessage
+	require.NoError(t, sonic.Unmarshal([]byte(raw), &item))
+	return item
+}
+
+const (
+	openAIClientToolSearchCall = `{"id":"tsc_1","type":"tool_search_call","execution":"client","call_id":"call_ts_1","status":"completed","arguments":{"query":"weather"}}`
+	openAIHostedToolSearchCall = `{"id":"tsc_2","type":"tool_search_call","execution":"server","call_id":null,"status":"completed","arguments":{"paths":["weather"]}}`
+	openAIHostedToolSearchOut  = `{"id":"tso_2","type":"tool_search_output","execution":"server","call_id":null,"status":"completed","tools":[{"type":"function","name":"` + tsDiscoveredTool + `","parameters":{"type":"object"},"defer_loading":true}]}`
+)
+
+func TestToolSearch_OpenAIClientCallBecomesToolUse(t *testing.T) {
+	t.Parallel()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	require.NotNil(t, clientToolSearchRequest().ToBifrostResponsesRequest(ctx))
+
+	resp := ToAnthropicResponsesResponse(ctx, &schemas.BifrostResponsesResponse{
+		Output: []schemas.ResponsesMessage{decodeResponsesItem(t, openAIClientToolSearchCall)},
+	})
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 1, "content=%+v", resp.Content)
+	block := resp.Content[0]
+	assert.Equal(t, AnthropicContentBlockTypeToolUse, block.Type)
+	require.NotNil(t, block.ID)
+	assert.Equal(t, "call_ts_1", *block.ID)
+	require.NotNil(t, block.Name)
+	assert.Equal(t, "ToolSearch", *block.Name)
+	assert.JSONEq(t, `{"query":"weather"}`, string(block.Input))
+	assert.Equal(t, AnthropicStopReasonToolUse, resp.StopReason)
+}
+
+func TestToolSearch_OpenAIHostedPairBecomesServerBlocks(t *testing.T) {
+	t.Parallel()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+
+	resp := ToAnthropicResponsesResponse(ctx, &schemas.BifrostResponsesResponse{
+		Output: []schemas.ResponsesMessage{
+			decodeResponsesItem(t, openAIHostedToolSearchCall),
+			decodeResponsesItem(t, openAIHostedToolSearchOut),
+		},
+	})
+	require.NotNil(t, resp)
+	require.Len(t, resp.Content, 2, "content=%+v", resp.Content)
+	use, result := resp.Content[0], resp.Content[1]
+	assert.Equal(t, AnthropicContentBlockTypeServerToolUse, use.Type)
+	require.NotNil(t, use.ID)
+	require.NotNil(t, use.Name)
+	assert.Equal(t, string(AnthropicToolNameToolSearchBM25), *use.Name)
+	assert.JSONEq(t, `{"paths":["weather"]}`, string(use.Input))
+	assert.Equal(t, AnthropicContentBlockTypeToolSearchToolResult, result.Type)
+	require.NotNil(t, result.ToolUseID)
+	assert.Equal(t, *use.ID, *result.ToolUseID)
+	require.Len(t, result.ToolReferences, 1)
+	assert.Equal(t, tsDiscoveredTool, *result.ToolReferences[0].ToolName)
+}
+
+// streamItemFrames wraps decoded items in output_item.added/done frames followed by
+// response.completed, the way the OpenAI stream delivers tool search items.
+func streamItemFrames(items ...schemas.ResponsesMessage) []*schemas.BifrostResponsesStreamResponse {
+	extra := schemas.BifrostResponseExtraFields{Provider: schemas.OpenAI}
+	var frames []*schemas.BifrostResponsesStreamResponse
+	for i := range items {
+		item := &items[i]
+		frames = append(frames,
+			&schemas.BifrostResponsesStreamResponse{Type: schemas.ResponsesStreamResponseTypeOutputItemAdded, OutputIndex: schemas.Ptr(i), Item: item, ExtraFields: extra},
+			&schemas.BifrostResponsesStreamResponse{Type: schemas.ResponsesStreamResponseTypeOutputItemDone, OutputIndex: schemas.Ptr(i), Item: item, ExtraFields: extra},
+		)
+	}
+	frames = append(frames, &schemas.BifrostResponsesStreamResponse{
+		Type:        schemas.ResponsesStreamResponseTypeCompleted,
+		Response:    &schemas.BifrostResponsesResponse{Output: items},
+		ExtraFields: extra,
+	})
+	return frames
+}
+
+func TestToolSearch_OpenAIClientCallStreamsAsToolUse(t *testing.T) {
+	t.Parallel()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	require.NotNil(t, clientToolSearchRequest().ToBifrostResponsesRequest(ctx))
+
+	var events []*AnthropicStreamEvent
+	for _, frame := range streamItemFrames(decodeResponsesItem(t, openAIClientToolSearchCall)) {
+		events = append(events, ToAnthropicResponsesStreamResponse(ctx, frame)...)
+	}
+
+	var start *AnthropicStreamEvent
+	var input strings.Builder
+	stops := 0
+	for _, e := range events {
+		switch e.Type {
+		case AnthropicStreamEventTypeContentBlockStart:
+			require.Nil(t, start, "only one block expected, events=%s", mustJSON(t, events))
+			start = e
+		case AnthropicStreamEventTypeContentBlockDelta:
+			require.NotNil(t, e.Delta)
+			require.NotNil(t, e.Delta.PartialJSON)
+			input.WriteString(*e.Delta.PartialJSON)
+		case AnthropicStreamEventTypeContentBlockStop:
+			stops++
+		}
+	}
+	require.NotNil(t, start, "events=%s", mustJSON(t, events))
+	require.NotNil(t, start.ContentBlock)
+	assert.Equal(t, AnthropicContentBlockTypeToolUse, start.ContentBlock.Type)
+	assert.Equal(t, "call_ts_1", *start.ContentBlock.ID)
+	assert.Equal(t, "ToolSearch", *start.ContentBlock.Name)
+	assert.JSONEq(t, `{"query":"weather"}`, input.String())
+	assert.Equal(t, 1, stops)
+}
+
+func TestToolSearch_OpenAIHostedPairStreamsAsServerBlocks(t *testing.T) {
+	t.Parallel()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+
+	var events []*AnthropicStreamEvent
+	for _, frame := range streamItemFrames(
+		decodeResponsesItem(t, openAIHostedToolSearchCall),
+		decodeResponsesItem(t, openAIHostedToolSearchOut),
+	) {
+		events = append(events, ToAnthropicResponsesStreamResponse(ctx, frame)...)
+	}
+
+	var starts []*AnthropicContentBlock
+	stops := 0
+	for _, e := range events {
+		switch e.Type {
+		case AnthropicStreamEventTypeContentBlockStart:
+			require.NotNil(t, e.ContentBlock, "events=%s", mustJSON(t, events))
+			starts = append(starts, e.ContentBlock)
+		case AnthropicStreamEventTypeContentBlockStop:
+			stops++
+		}
+	}
+	require.Len(t, starts, 2, "events=%s", mustJSON(t, events))
+	assert.Equal(t, AnthropicContentBlockTypeServerToolUse, starts[0].Type)
+	assert.JSONEq(t, `{"paths":["weather"]}`, string(starts[0].Input))
+	assert.Equal(t, AnthropicContentBlockTypeToolSearchToolResult, starts[1].Type)
+	require.NotNil(t, starts[1].ToolUseID)
+	assert.Equal(t, *starts[0].ID, *starts[1].ToolUseID)
+	require.Len(t, starts[1].ToolReferences, 1)
+	assert.Equal(t, tsDiscoveredTool, *starts[1].ToolReferences[0].ToolName)
+	assert.Equal(t, 2, stops)
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := sonic.Marshal(v)
+	require.NoError(t, err)
+	return string(b)
+}
+
+// On the request path (history sent to Anthropic) verbatim OpenAI tool search items
+// have no Anthropic block, so they are dropped rather than rebuilt as server blocks
+// for a server tool the request never declared.
+func TestToolSearch_RequestPathDropsVerbatimOpenAIItems(t *testing.T) {
+	t.Parallel()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	history := []schemas.ResponsesMessage{
+		{Role: schemas.Ptr(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("weather?")}},
+		decodeResponsesItem(t, openAIHostedToolSearchCall),
+		decodeResponsesItem(t, openAIHostedToolSearchOut),
+		decodeResponsesItem(t, openAIClientToolSearchCall),
+	}
+	msgs, _ := ConvertBifrostMessagesToAnthropicMessages(ctx, history, true,
+		schemas.ResolveModelCaps(schemas.Anthropic, "claude-sonnet-4-6"))
+	body := mustJSON(t, msgs)
+	assert.NotContains(t, body, "server_tool_use")
+	assert.NotContains(t, body, "tool_search_tool_result")
+	assert.NotContains(t, body, "tool_use")
+}
