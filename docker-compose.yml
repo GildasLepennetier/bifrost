@@ -1,0 +1,26 @@
+# Run Bifrost locally with Docker Compose.
+#
+#   export BIFROST_SETUP_TOKEN=$(openssl rand -hex 32)   # or put it in a .env file next to this one
+#   docker compose up -d
+#   open http://localhost:8086
+#
+# On first visit the dashboard asks for the setup token: paste the same value,
+# then create your admin account. The token stops working once auth is enabled.
+
+services:
+  bifrost:
+    image: maximhq/bifrost:latest
+    container_name: bifrost
+    restart: unless-stopped
+    ports:
+      - "8086:8080"
+    environment:
+      BIFROST_SETUP_TOKEN: ${BIFROST_SETUP_TOKEN:?set BIFROST_SETUP_TOKEN (e.g. openssl rand -hex 32)}
+      LOG_LEVEL: info
+      LOG_STYLE: json
+    volumes:
+      # Persists config.db, logs.db, and an optional config.json across restarts.
+      - bifrost-data:/app/data
+
+volumes:
+  bifrost-data:
