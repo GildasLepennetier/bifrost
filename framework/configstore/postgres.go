@@ -31,7 +31,7 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// 0A000 ("cached plan must not change result type") structurally impossible
 	// when a migration mixes DDL with subsequent SELECTs against the same table.
 	// Runtime pools keep the default cache-statement mode for performance.
-	migrationDSN := dsn + " default_query_exec_mode=simple_protocol"
+	migrationDSN := postgresconn.MigrationDSN(dsn)
 
 	// Throwaway pool for schema migrations. Closing it before the runtime pool
 	// opens guarantees no cached prepared-plan survives the DDL.
