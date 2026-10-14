@@ -4,9 +4,17 @@
 
 Official Helm charts for deploying [Bifrost](https://github.com/maximhq/bifrost) - a high-performance AI gateway with unified interface for multiple providers.
 
-**Latest Version:** 2.1.44
+**Latest Version:** 2.1.45
 
 ## Changelog
+
+### 2.1.45
+
+- Added `bifrost.loadBalancer.rerouteTarget`, `historyEnabled`, `historyRetentionDays` and `snapshotPersistIntervalSeconds`. They render into `load_balancer_config.reroute_target`, `history_enabled`, `history_retention_days` and `snapshot_persist_interval_seconds`; previously these settings had no Helm path.
+- Removed `bifrost.loadBalancer.trackerConfig` and `bootstrap`, and the `enabled: true` the chart rendered into `load_balancer_config`. Bifrost ignores all three. `bifrost.loadBalancer.enabled` still decides whether `load_balancer_config` is rendered.
+- `circuitBreakerConfig` policies: `default_cooldown` accepts any Go duration (e.g. `1m30s`) or integer nanoseconds, `condition.operator` is case-insensitive, setting both `header_value` and `header_contains` on a signal is rejected, and name, provider and model fields must be non-empty.
+- Routing rules: targets and object fallbacks accept `key_id`, rules accept `chain_rule`, and the example in `values.yaml` no longer uses invalid values (`model: ""`, bare `fallbacks: ["openai"]`).
+- A provider key's `weight` is now optional, as documented; the chart already defaults it to 1.
 
 ### 2.1.44
 
