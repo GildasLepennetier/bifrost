@@ -1,6 +1,8 @@
 # Run Bifrost locally with Docker Compose.
 #
-#   export BIFROST_SETUP_TOKEN=$(openssl rand -hex 32)   # or put it in a .env file next to this one
+#   touch .env
+#   openssl rand -hex 32
+#   BIFROST_SETUP_TOKEN=
 #   docker compose up -d
 #   open http://localhost:8086
 #
